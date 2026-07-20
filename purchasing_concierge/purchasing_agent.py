@@ -1,41 +1,12 @@
-"""
-Copyright 2025 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
 import json
 import uuid
-from typing import List
-import httpx
+from typing import Dict
+import os
 
 from google.adk import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
-from .remote_agent_connection import RemoteAgentConnections
-
-from a2a.client import A2ACardResolver
-from a2a.types import (
-    AgentCard,
-    MessageSendParams,
-    Part,
-    SendMessageRequest,
-    SendMessageResponse,
-    SendMessageSuccessResponse,
-    Task,
-)
-
 
 class PurchasingAgent:
     """The purchasing agent.
@@ -46,13 +17,22 @@ class PurchasingAgent:
 
     def __init__(
         self,
-        remote_agent_addresses: List[str],
+        agent_ids: Dict[str, str],
     ):
-        self.remote_agent_connections: dict[str, RemoteAgentConnections] = {}
-        self.remote_agent_addresses = remote_agent_addresses
-        self.cards: dict[str, AgentCard] = {}
+        self.agent_ids = agent_ids
         self.agents = ""
         self.a2a_client_init_status = False
+        # Static definitions for description in prompt
+        self.agent_metadata = {
+            "burger_seller_agent": {
+                "name": "burger_seller_agent",
+                "description": "Helps with understanding burger menu, prices, and creating burger orders. Menu: Classic Cheeseburger (85K), Double Cheeseburger (110K), Spicy Chicken Burger (80K), Spicy Cajun Burger (85K)."
+            },
+            "pizza_seller_agent": {
+                "name": "pizza_seller_agent",
+                "description": "Specialized agent for ordering pizzas. Supports bbq, thai, mexican, indian, and italian variants. Menu: Margherita (100K), Pepperoni (140K), Hawaiian (110K), Veggie (100K), BBQ Chicken (130K)."
+            }
+        }
 
     def create_agent(self) -> Agent:
         return Agent(
@@ -111,23 +91,10 @@ Current active seller agent: {current_agent["active_agent"]}
 
     async def before_agent_callback(self, callback_context: CallbackContext):
         if not self.a2a_client_init_status:
-            httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(timeout=30))
-            for address in self.remote_agent_addresses:
-                card_resolver = A2ACardResolver(
-                    base_url=address, httpx_client=httpx_client
-                )
-                try:
-                    card = await card_resolver.get_agent_card()
-                    remote_connection = RemoteAgentConnections(
-                        agent_card=card, agent_url=card.url
-                    )
-                    self.remote_agent_connections[card.name] = remote_connection
-                    self.cards[card.name] = card
-                except httpx.ConnectError:
-                    print(f"ERROR: Failed to get agent card from : {address}")
             agent_info = []
-            for ra in self.list_remote_agents():
-                agent_info.append(json.dumps(ra))
+            for name, meta in self.agent_metadata.items():
+                if name in self.agent_ids:
+                    agent_info.append(json.dumps({"name": meta["name"], "description": meta["description"]}))
             self.agents = "\n".join(agent_info)
             self.a2a_client_init_status = True
 
@@ -140,95 +107,73 @@ Current active seller agent: {current_agent["active_agent"]}
                 state["session_id"] = str(uuid.uuid4())
             state["session_active"] = True
 
-    def list_remote_agents(self):
-        """List the available remote agents you can use to delegate the task."""
-        if not self.remote_agent_connections:
-            return []
-
-        remote_agent_info = []
-        for card in self.cards.values():
-            print(f"Found agent card: {card.model_dump()}")
-            print("=" * 100)
-            remote_agent_info.append(
-                {"name": card.name, "description": card.description}
-            )
-        return remote_agent_info
-
-    def send_task(self, agent_name: str, task: str, tool_context: ToolContext):
-        """Sends a task to remote seller agent
+    def send_task(self, agent_name: str, task: str, tool_context: ToolContext) -> str:
+        """Sends a task to remote seller agent.
 
         This will send a message to the remote agent named agent_name.
 
         Args:
-            agent_name: The name of the agent to send the task to.
-            task: The comprehensive conversation context summary
-                and goal to be achieved regarding user inquiry and purchase request.
-            tool_context: The tool context this method runs in.
-
-        Yields:
-            A dictionary of JSON data.
+            agent_name: The name of the agent to send the task to. Must be one of: burger_seller_agent, pizza_seller_agent.
+            task: The comprehensive conversation context summary and goal to be achieved regarding user inquiry and purchase request.
         """
-        if agent_name not in self.remote_agent_connections:
-            raise ValueError(f"Agent {agent_name} not found")
+        if agent_name not in self.agent_ids:
+            return f"Error: Agent {agent_name} not found"
+            
         state = tool_context.state
         state["active_agent"] = agent_name
-        client = self.remote_agent_connections[agent_name]
-        if not client:
-            raise ValueError(f"Client not available for {agent_name}")
-        session_id = state["session_id"]
-        task: Task
-        message_id = ""
-        metadata = {}
-        if "input_message_metadata" in state:
-            metadata.update(**state["input_message_metadata"])
-            if "message_id" in state["input_message_metadata"]:
-                message_id = state["input_message_metadata"]["message_id"]
-        if not message_id:
-            message_id = str(uuid.uuid4())
+        
+        agent_id = self.agent_ids[agent_name]
+        session_id = state.get("session_id", "default_session")
 
-        payload = {
-            "message": {
-                "role": "user",
-                "parts": [
-                    {"type": "text", "text": task}
-                ],  # Use the 'task' argument here
-                "messageId": message_id,
-                "contextId": session_id,
-            },
-        }
+        import vertexai
+        from vertexai.preview import reasoning_engines
+        
+        # Initialize vertexai with default credentials if needed, but it should inherit from environment
+        project = os.getenv("GOOGLE_CLOUD_PROJECT")
+        location = os.getenv("GOOGLE_CLOUD_LOCATION")
+        vertexai.init(project=project, location=location)
 
-        message_request = SendMessageRequest(
-            id=message_id, params=MessageSendParams.model_validate(payload)
-        )
-        send_response: SendMessageResponse = client.send_message(
-            message_request=message_request
-        )
-        print(
-            "send_response",
-            send_response.model_dump_json(exclude_none=True, indent=2),
-        )
+        import vertexai
+        from vertexai.preview import reasoning_engines
+        from google.cloud.aiplatform_v1beta1 import types as aip_types
+        from vertexai.reasoning_engines import _utils
 
-        if not isinstance(send_response.root, SendMessageSuccessResponse):
-            print("received non-success response. Aborting get task ")
-            return None
+        try:
+            print(f"Calling remote agent {agent_name} (ID: {agent_id}) with task: {task}")
+            engine = reasoning_engines.ReasoningEngine(agent_id)
+            execution_client = engine.execution_api_client
+            
+            input_data = {
+                "message": task,
+                "user_id": "purchasing_agent",
+                "session_id": session_id
+            }
 
-        if not isinstance(send_response.root.result, Task):
-            print("received non-task response. Aborting get task ")
-            return None
-
-        return send_response.root.result
-
-
-def convert_parts(parts: list[Part], tool_context: ToolContext):
-    rval = []
-    for p in parts:
-        rval.append(convert_part(p, tool_context))
-    return rval
-
-
-def convert_part(part: Part, tool_context: ToolContext):
-    # Currently only support text parts
-    if part.type == "text":
-        return part.text
-
-    return f"Unknown type: {part.type}"
+            request = aip_types.StreamQueryReasoningEngineRequest(
+                name=engine.resource_name,
+                input=input_data,
+                class_method="stream_query"
+            )
+            
+            response_stream = execution_client.stream_query_reasoning_engine(request=request)
+            
+            collected_text = []
+            for chunk in response_stream:
+                try:
+                    for parsed_json in _utils.yield_parsed_json(chunk):
+                        if parsed_json is not None and "content" in parsed_json:
+                            parts = parsed_json["content"].get("parts", [])
+                            for part in parts:
+                                if "text" in part:
+                                    collected_text.append(part["text"])
+                except Exception as parse_err:
+                    print(f"Error parsing chunk: {parse_err}")
+                    
+            if collected_text:
+                response_text = "".join(collected_text)
+                print(f"Response from {agent_name}: {response_text}")
+                return response_text
+            return "Failed to get response from agent."
+        except Exception as e:
+            print(f"Error calling remote agent {agent_name}: {e}")
+            return f"Error calling agent {agent_name}: {e}"

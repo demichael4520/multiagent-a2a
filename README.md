@@ -1,167 +1,114 @@
-# Purchasing Concierge A2A Demo
+# Multi-Agent Purchasing Concierge on Vertex AI Agent Runtime (ADK)
 
-> **⚠️ DISCLAIMER: THIS IS NOT AN OFFICIALLY SUPPORTED GOOGLE PRODUCT. THIS PROJECT IS INTENDED FOR DEMONSTRATION PURPOSES ONLY. IT IS NOT INTENDED FOR USE IN A PRODUCTION ENVIRONMENT.**
+This project implements a multi-agent purchasing concierge system deployed on **Vertex AI Agent Runtime (Reasoning Engine)** using the Google **Agent Development Kit (ADK)**. 
 
-This demo shows how to enable A2A (Agent2Agent) protocol communication between purchasing concierge agent with the remote pizza and burger seller agents using A2A Python SDK. Burger and Pizza seller agents is a independent agent that can be run on different server with different frameworks, in this demo example we, burger agent is built on top of Crew AI and pizza agent is built on top of LangGraph.
+It is adapted from the [A2A Purchasing Concierge Codelab](https://codelabs.developers.google.com/intro-a2a-purchasing-concierge?hl=en#1), shifting the target runtime from Cloud Run to Agent Runtime (Reasoning Engines) for enhanced integration with Google's agent platform.
 
-Detailed tutorial about this repo: [Getting Started with Agent2Agent (A2A) Protocol: A Purchasing Concierge and Remote Seller Agent Interactions with Gemini on Cloud Run](https://codelabs.developers.google.com/intro-a2a-purchasing-concierge?utm_campaign=CDR_0x6a71b73a_default_b415667894&utm_medium=external&utm_source=blog)
+## Architecture Overview
+
+The system consists of three independent agents executing on separate Reasoning Engine runtimes:
+
+```mermaid
+graph TD
+    Client[Client / Playground] -->|Query| Concierge[Purchasing Concierge <br> Root Agent]
+    Concierge -->|GAPIC stream_query| BurgerAgent[Burger Seller Agent]
+    Concierge -->|GAPIC stream_query| PizzaAgent[Pizza Seller Agent]
+    BurgerAgent -->|Tool| CreateBurger[create_burger_order]
+    PizzaAgent -->|Tool| CreatePizza[create_pizza_order]
+```
+
+1.  **Purchasing Concierge (Root Agent)**: Coordinates the purchasing flow. It receives the user's intent (e.g., ordering both burgers and pizzas), splits the request, programmatically queries the respective seller agents, aggregates their responses, and returns the final order confirmation.
+2.  **Burger Seller Agent**: A specialized agent handling queries about the burger menu and executing order creation.
+3.  **Pizza Seller Agent**: A specialized agent handling queries about the pizza menu and executing order creation.
+
+---
+
+## Technical Details & Workarounds
+
+To support cross-agent communication on Vertex AI Agent Runtime, several platform limitations had to be addressed:
+
+1.  **Custom Client-Side Call Routing**: Since Reasoning Engines do not expose public HTTP endpoints, ADK's native `RemoteA2aAgent` (which relies on standard A2A HTTP protocols and GET `/agent.json` cards) cannot be used directly. Instead, the Purchasing Concierge uses a **custom Python tool** (`send_task`) that routes queries programmatically via the **Vertex AI GAPIC streaming client** (`stream_query_reasoning_engine`).
+2.  **Session Auto-Creation Monkey-Patch**: The ADK template (`AdkApp`) normally throws a `SessionNotFoundError` if a client queries it with a new `session_id`. Since the Concierge must propagate its session tracking, we **monkey-patch** `google.adk.runners.Runner` inside the seller agents at runtime to enforce `auto_create_session = True`.
+3.  **Interactive Playground Compatibility**: ADK agents require multiple parameters (`message`, `user_id`) which conflict with the Google Cloud Console Playground's single-argument expectation. The Purchasing Concierge is wrapped in `PlaygroundCompatibleAdkAgent` to map playground payloads to ADK's internal streaming runner.
+
+---
 
 ## Prerequisites
 
-- If you are executing this project from your local IDE, Login to Gcloud using CLI with the following command :
-
-    ```shell
-    gcloud auth application-default login
-    ```
-
-- Enable the following APIs
-
-    ```shell
-    gcloud services enable aiplatform.googleapis.com 
-    ```
-
-- Install [uv](https://docs.astral.sh/uv/getting-started/installation/) dependencies and prepare the python env
-
-    ```shell
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    uv python install 3.12
-    uv sync --frozen
-    ```
-
-## How to Run
-
-First, we need to run the remote seller agents. We have two remote seller agents, one is burger agent and the other is pizza agent. We need to run them separately. These agents will serve the A2A Server
-
-### Run the Burger Agent - Locally
-
-1. Copy the `remote_seller_agents/burger_agent/.env.example` to `remote_seller_agents/burger_agent/.env`.
-2. Fill in the required environment variables in the `.env` file. Substitute `GOOGLE_CLOUD_PROJECT` with your Google Cloud Project ID.
-
+Ensure you have the following before starting:
+*   A Google Cloud Project with the Vertex AI API enabled.
+*   The `gcloud` CLI installed and authenticated.
+*   Python 3.10+ environment with the Vertex AI SDK and ADK installed:
     ```bash
-    GOOGLE_CLOUD_LOCATION=us-central1
-    GOOGLE_CLOUD_PROJECT={your-project-id}
+    pip install google-cloud-aiplatform[agent_engines] google-adk==1.31.1 pydantic cloudpickle
     ```
 
-3. Run the burger agent.
+---
 
-    ```bash
-    cd remote_seller_agents/burger_agent
-    uv sync --frozen
-    uv run .
-    ```
+## Deployment Sequence
 
-4. It will run on `http://localhost:10001`
+Deployment must follow a strict order because the Root Agent requires the Resource IDs of the Seller Agents at deployment time.
 
-### Run the Pizza Agent - Locally
-
-1. Copy the `remote_seller_agents/pizza_agent/.env.example` to `remote_seller_agents/pizza_agent/.env`.
-2. Fill in the required environment variables in the `.env` file. Substitute `GOOGLE_CLOUD_PROJECT` with your Google Cloud Project ID.
-
-    ```bash
-    GOOGLE_CLOUD_LOCATION=us-central1
-    GOOGLE_CLOUD_PROJECT={your-project-id}
-    ```
-
-3. Run the pizza agent.
-
-    ```bash
-    cd remote_seller_agents/pizza_agent
-    uv sync --frozen
-    uv run .
-    ```
-
-4. It will run on `http://localhost:10000`
-
-### Run the Purchasing Concierge Agent - Locally
-
-Finally, we can run our A2A client capabilities owned by purchasing concierge agent.
-
-1. Go back to demo root directory ( where `purchasing_concierge` directory is located )
-2. Copy the `purchasing_concierge/.env.example` to `purchasing_concierge/.env`.
-3. Fill in the required environment variables in the `.env` file. Substitute `GOOGLE_CLOUD_PROJECT` with your Google Cloud Project ID.
-   And fill in the `PIZZA_SELLER_AGENT_URL` and `BURGER_SELLER_AGENT_URL` with the URL of the remote seller agents.
-
-    ```bash
-    PIZZA_SELLER_AGENT_URL=http://localhost:10000
-    BURGER_SELLER_AGENT_URL=http://localhost:10001
-    GOOGLE_GENAI_USE_VERTEXAI=TRUE
-    GOOGLE_CLOUD_PROJECT={your-project-id}
-    GOOGLE_CLOUD_LOCATION=us-central1
-    ```
-
-4. Run the purchasing concierge agent with the adk web dev UI
-
-    ```bash
-    uv sync --frozen
-    uv run adk web
-    ```
-
-## Deployment
-
-### Deploy the Burger Agent - Cloud Run
-
-Run the following command
-
+### Step 1: Deploy Seller Agents
+Run the deployment script to deploy both the Burger and Pizza seller agents:
 ```bash
-gcloud run deploy burger-agent \
-    --source remote_seller_agents/burger_agent \
-    --port=8080 \
-    --allow-unauthenticated \
-    --min 1 \
-    --region us-central1 \
-    --update-env-vars GOOGLE_CLOUD_LOCATION=us-central1 \
-    --update-env-vars GOOGLE_CLOUD_PROJECT={your-project-id}
+python deploy_sellers_adk.py
+```
+This script will:
+1.  Package and deploy the Burger Agent to Agent Runtime.
+2.  Package and deploy the Pizza Agent to Agent Runtime.
+3.  Write the deployed Resource IDs to a local file named `seller_agents.env`.
+
+### Step 2: Deploy Purchasing Concierge (Root Agent)
+Run the deployment script for the Purchasing Concierge:
+```bash
+python deploy_concierge_adk.py
+```
+This script will:
+1.  Read the Seller Agent Resource IDs from `seller_agents.env` and set them as environment variables inside the Concierge's container.
+2.  Wrap the Concierge in the Playground compatibility helper.
+3.  Deploy the Concierge to Agent Runtime and print its Resource ID.
+
+---
+
+## Querying the Root Agent
+
+### 1. Google Cloud Console Playground (Interactive UI)
+1. Go to the [Vertex AI Reasoning Engine Console](https://console.cloud.google.com/vertex-ai/reasoning-engines).
+2. Click on the deployed **`purchasing-concierge-adk`** agent.
+3. Use the right-hand **Test Agent** panel to chat directly.
+
+### 2. Python SDK
+```python
+import vertexai
+from vertexai.preview.reasoning_engines import ReasoningEngine
+
+vertexai.init(project="ge-test-3p-only-2", location="us-central1")
+agent = ReasoningEngine("YOUR_CONCIERGE_RESOURCE_ID")
+
+response = agent.query(
+    input="I want to order 1 classic cheeseburger and 2 pepperoni pizzas.",
+    user_id="customer_1"
+)
+print(response.get("output"))
 ```
 
-### Deploy the Pizza Agent - Cloud Run
-
-Run the following command
-
-```bash
-gcloud run deploy pizza-agent \
-    --source remote_seller_agents/pizza_agent \
-    --port=8080 \
-    --allow-unauthenticated \
-    --min 1 \
-    --region us-central1 \
-    --update-env-vars GOOGLE_CLOUD_PROJECT={your-project-id} \
-    --update-env-vars GOOGLE_CLOUD_LOCATION=us-central1
-```
-
-### Deploy Purchasing Concierge Agent - Agent Engine
-
-1. Create the staging bucket first
-
-    ```bash
-    gcloud storage buckets create gs://purchasing-concierge-{your-project-id} --location=us-central1
-    ```
-
-2. Copy the `.env.example` to `.env`.
-3. Fill in the required environment variables in the `.env` file. Substitute `GOOGLE_CLOUD_PROJECT` with your Google Cloud Project ID.
-
-    ```bash
-    GOOGLE_GENAI_USE_VERTEXAI=TRUE
-    GOOGLE_CLOUD_PROJECT={your-project-id}
-    GOOGLE_CLOUD_LOCATION=us-central1
-    STAGING_BUCKET=gs://purchasing-concierge-{your-project-id}
-    PIZZA_SELLER_AGENT_URL={your-pizza-agent-url}
-    BURGER_SELLER_AGENT_URL={your-burger-agent-url}
-    ```
-
-4. Deploy the purchasing concierge agent to agent engine
-
-    ```bash
-    uv sync --frozen
-    uv run deploy_to_agent_engine.py
-    ```
-
-### Run the Chat Interface to Connect to Agent Engine
-
-1. Update the `.env` file with the `AGENT_ENGINE_RESOURCE_NAME` which obtained from the previous step.
-
-2. Run the Gradio app
+### 3. REST API via curl
+To send a prompt using the REST API from your terminal, execute the following commands:
 
 ```bash
-uv sync --frozen
-uv run purchasing_concierge_ui.py
+# 1. Get an authentication token
+TOKEN=$(gcloud auth print-access-token)
+
+# 2. Make the POST call to the query endpoint
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  https://us-central1-aiplatform.googleapis.com/v1beta1/projects/ge-test-3p-only-2/locations/us-central1/reasoningEngines/3258707823390883840:query \
+  -d '{
+    "input": {
+      "input": "I want to order 1 classic cheeseburger and 2 pepperoni pizzas.",
+      "user_id": "terminal_user"
+    }
+  }'
 ```
