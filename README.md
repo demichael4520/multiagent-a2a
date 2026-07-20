@@ -9,12 +9,36 @@ It is adapted from the [A2A Purchasing Concierge Codelab](https://codelabs.devel
 The system consists of three independent agents executing on separate Reasoning Engine runtimes:
 
 ```mermaid
-graph TD
-    Client[Client / Playground] -->|Query| Concierge[Purchasing Concierge <br> Root Agent]
-    Concierge -->|GAPIC stream_query| BurgerAgent[Burger Seller Agent]
-    Concierge -->|GAPIC stream_query| PizzaAgent[Pizza Seller Agent]
-    BurgerAgent -->|Tool| CreateBurger[create_burger_order]
-    PizzaAgent -->|Tool| CreatePizza[create_pizza_order]
+sequenceDiagram
+    autonumber
+    actor Client as User / Client
+    participant Concierge as Purchasing Concierge (Root Agent)
+    participant Burger as Burger Seller Agent
+    participant Pizza as Pizza Seller Agent
+
+    Client->>Concierge: query("I want to order 1 burger and 2 pizzas")
+    activate Concierge
+    Note over Concierge: Concierge parses query and<br/>identifies sub-tasks for sellers.
+    
+    par Call Burger Agent
+        Concierge->>Burger: stream_query("Order 1 classic cheeseburger", session_id)
+        activate Burger
+        Note over Burger: Runner forces auto_create_session
+        Burger->>Burger: execute tool: create_burger_order()
+        Burger-->>Concierge: returns Order ID & Summary
+        deactivate Burger
+    and Call Pizza Agent
+        Concierge->>Pizza: stream_query("Order 2 pepperoni pizzas", session_id)
+        activate Pizza
+        Note over Pizza: Runner forces auto_create_session
+        Pizza->>Pizza: execute tool: create_pizza_order()
+        Pizza-->>Concierge: returns Order ID & Summary
+        deactivate Pizza
+    end
+
+    Note over Concierge: Concierge aggregates seller<br/>responses and formats final text.
+    Concierge-->>Client: returns aggregated order confirmation
+    deactivate Concierge
 ```
 
 1.  **Purchasing Concierge (Root Agent)**: Coordinates the purchasing flow. It receives the user's intent (e.g., ordering both burgers and pizzas), splits the request, programmatically queries the respective seller agents, aggregates their responses, and returns the final order confirmation.
